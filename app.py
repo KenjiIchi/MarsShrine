@@ -56,6 +56,7 @@ def mars_chat(message: str, session_id: str, speaker: str):
         headers = {
             "Authorization": f"Bearer {MARS_API_KEY}",
             "X-API-Key": MARS_API_KEY,             # alguns proxies pedem também
+            "User-Agent": "Mozilla/5.0 (compatible; MarsBridge/1.0)",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
