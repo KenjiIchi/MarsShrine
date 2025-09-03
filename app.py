@@ -42,37 +42,44 @@ def _mars_ready():
 
 def mars_chat(message: str, session_id: str, speaker: str):
     """Chama a IA Mars/Asha/etc. Retorna (reply, err)."""
-    if not _mars_ready():
+    if not (MARS_API_KEY and MARS_API_URL):
         return None, "missing_mars_env"
+
     url = MARS_API_URL.rstrip("/") + MARS_CHAT_PATH
     payload = {
         "messages": [{"role": "user", "content": message}],
     }
     if MARS_MODEL:
         payload["model"] = MARS_MODEL
+
     try:
-        r = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {MARS_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=MARS_TIMEOUT,
-        )
-        # tenta formatos típicos OpenAI-compatíveis
-        jr = {}
-        if r.headers.get("content-type", "").lower().startswith("application/json"):
+        headers = {
+            "Authorization": f"Bearer {MARS_API_KEY}",
+            "X-API-Key": MARS_API_KEY,             # alguns proxies pedem também
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=MARS_TIMEOUT)
+
+        # Conteúdo do upstream (para debug controlado)
+        ct = (r.headers.get("content-type") or "").lower()
+        text_preview = r.text[:400] if r.text else ""
+
+        # Sucesso
+        if r.status_code == 200 and ct.startswith("application/json"):
             jr = r.json()
-        # extrai resposta
-        reply = (
-            jr.get("output")
-            or jr.get("reply")
-            or (jr.get("choices", [{}])[0].get("message", {}).get("content"))
-        )
-        if reply:
-            return reply, None
-        return None, f"empty_reply_status_{r.status_code}"
+            reply = (
+                jr.get("output")
+                or jr.get("reply")
+                or (jr.get("choices", [{}])[0].get("message", {}).get("content"))
+            )
+            if reply:
+                return reply, None
+            return None, "empty_json_body"
+
+        # Falha: devolve status e trechinho do corpo para sabermos o motivo
+        return None, f"upstream_{r.status_code}:{text_preview or 'no-body'}"
+
     except Exception as e:
         return None, f"exception:{type(e).__name__}"
 
