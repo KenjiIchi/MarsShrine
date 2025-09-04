@@ -58,8 +58,16 @@ PROFILE_MAP = _load_profiles(PROFILES_JSON)
 # ── FLASK ───────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app)
-# JSON bonito em UTF-8 (sem \uXXXX)
+
+# JSON bonito em UTF-8 (sem \uXXXX) e header com charset pro SL
 app.json.ensure_ascii = False
+
+@app.after_request
+def force_json_utf8(resp):
+    ct = resp.headers.get("Content-Type", "")
+    if ct.startswith("application/json") and "charset=" not in ct.lower():
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp
 
 # ── HELPERS ─────────────────────────────────────────────────────────────────
 def _error(message: str, status: int = 400):
@@ -213,8 +221,10 @@ def mars_chat(messages: list, params: dict):
 
     # Top-p/k, min_tokens, stops (se suportado pelo proxy)
     if MARS_TOP_P != "":
-        try: payload["top_p"] = float(MARS_TOP_P)
-        except: pass
+        try:
+            payload["top_p"] = float(MARS_TOP_P)
+        except Exception:
+            pass
     if MARS_TOP_K and MARS_TOP_K > 0:
         payload["top_k"] = int(MARS_TOP_K)
     if MARS_MIN_TOKENS and MARS_MIN_TOKENS > 0:
