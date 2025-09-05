@@ -1,12 +1,14 @@
 # app.py — SL ↔ Flask Bridge
 # - Perfis via PROFILES_JSON + DEFAULT_PROFILE
-# - Memória com persistência opcional (SQLite)
+# - Memória com persistência opcional (SQLite) + criação automática da pasta
 # - Charset UTF-8 (corrige JP no SL)
 # - /health, /diag, /memory/export, /memory/clear
 # - Fallback ECHO quando upstream falha
+# - Sanitização de tokens (</s>, [INST], [/INST]) no reply
 # - Pronto para Render + gunicorn
 
 import os
+import re
 import time
 import json
 import sqlite3
@@ -36,11 +38,11 @@ PROFILES_JSON   = os.getenv("PROFILES_JSON", "{}")
 DEFAULT_PROFILE = os.getenv("DEFAULT_PROFILE", "").strip()
 
 # Knobs globais (sobrescritíveis por perfil)
-MARS_MAX_TOKENS        = int(float(os.getenv("MARS_MAX_TOKENS", "220")))
-MARS_TEMPERATURE       = float(os.getenv("MARS_TEMPERATURE", "1.0"))
-MARS_FREQUENCY_PENALTY = float(os.getenv("MARS_FREQUENCY_PENALTY", "0.0"))
-MARS_PRESENCE_PENALTY  = float(os.getenv("MARS_PRESENCE_PENALTY", "0.0"))
-MARS_REPETITION_PENALTY= float(os.getenv("MARS_REPETITION_PENALTY", "1.0"))
+MARS_MAX_TOKENS         = int(float(os.getenv("MARS_MAX_TOKENS", "220")))
+MARS_TEMPERATURE        = float(os.getenv("MARS_TEMPERATURE", "1.0"))
+MARS_FREQUENCY_PENALTY  = float(os.getenv("MARS_FREQUENCY_PENALTY", "0.0"))
+MARS_PRESENCE_PENALTY   = float(os.getenv("MARS_PRESENCE_PENALTY", "0.0"))
+MARS_REPETITION_PENALTY = float(os.getenv("MARS_REPETITION_PENALTY", "1.0"))
 
 # Decoding (opcionais)
 MARS_TOP_P      = os.getenv("MARS_TOP_P", "")
@@ -90,6 +92,14 @@ def _clip(s: str, limit: int = 900) -> str:
     s = s or ""
     return (s[:limit-3] + "...") if len(s) > limit else s
 
+def _clean_artifacts(s: str) -> str:
+    """Remove tokens de template comuns (</s>, [INST], [/INST]) e espaços invisíveis."""
+    if not s:
+        return s
+    s = re.sub(r'(</s>|\[/?INST\])\s*', '', s, flags=re.IGNORECASE)
+    s = s.replace('\u200b', '').strip()
+    return s
+
 def _read_token(payload: dict):
     tok = request.headers.get("X-Auth-Token") or request.headers.get("Authorization")
     if not tok:
@@ -122,9 +132,14 @@ _db_lock = threading.Lock()
 _db_conn = None
 
 def _db():
-    """Abre/cria o SQLite quando necessário."""
+    """Abre/cria o SQLite quando necessário (cria diretório pai, se preciso)."""
     global _db_conn
     if _db_conn is None:
+        parent = os.path.dirname(MEMORY_DB_PATH) or "."
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
         _db_conn = sqlite3.connect(MEMORY_DB_PATH, check_same_thread=False)
         _db_conn.execute("PRAGMA journal_mode=WAL;")
         _db_conn.execute("""
@@ -154,7 +169,6 @@ def _db_fetch_recent(sid: str, turns: int, char_cap: int):
     if not PERSIST_ENABLED:
         return []
     with _db_lock:
-        # pega mensagens extras e poda depois
         cur = _db().execute(
             "SELECT role, content FROM memory WHERE session_id=? ORDER BY ts DESC LIMIT ?",
             (sid, 2*max(1, int(turns))*3)
@@ -464,6 +478,9 @@ def chat():
     if reply is None:
         reply = f"[ECHO] {speaker+': ' if speaker else ''}{message}"
         mode = "echo"
+
+    # sanitiza antes de clipar e salvar na memória
+    reply = _clean_artifacts(reply)
     reply = _clip(reply, 900)
 
     # Atualiza memória
