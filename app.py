@@ -10,9 +10,6 @@ from typing import List, Dict
 import requests
 from flask import Flask, request, jsonify
 
-# -----------------------------
-# Config & ENV
-# -----------------------------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "kenji-2025-bridge")
 
 MARS_API_URL = os.getenv("MARS_API_URL", "https://mars.chub.ai/chub/soji/v1")
@@ -33,7 +30,6 @@ MARS_MAX_TOKENS = int(os.getenv("MARS_MAX_TOKENS", "220"))
 MARS_MIN_TOKENS = int(os.getenv("MARS_MIN_TOKENS", "0"))
 MARS_STOP = os.getenv("MARS_STOP", "")
 
-# ✅ Default to /var/data on Render; fallback to /tmp if needed
 DEFAULT_DB = "/var/data/memory.sqlite"
 PERSIST_ENABLED = os.getenv("PERSIST_ENABLED", "false").lower() == "true"
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", DEFAULT_DB)
@@ -43,22 +39,12 @@ MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "3500"))
 MASTER_UUID = os.getenv("MASTER_UUID", "926f0717-f528-4ec2-817a-6690a605e0e6")
 ALLOWLIST = set([x.strip() for x in os.getenv("ALLOWLIST", MASTER_UUID).split(",") if x.strip()])
 
-# -----------------------------
-# App & Storage
-# -----------------------------
 app = Flask(__name__)
 
-# In-memory history fallback
 _history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MEMORY_TURNS * 2))
-# Sticky state per session (key/value you "remember")
 _sticky: Dict[str, Dict[str, str]] = defaultdict(dict)
-
-# Global toggle (server-side kill-switch)
 ENABLED = True
 
-# -----------------------------
-# DB helpers (optional persistence)
-# -----------------------------
 def _ensure_parent_dir(path: str):
     parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
@@ -99,7 +85,6 @@ def _init_db():
         except Exception as e:
             print(f"[memory] failed at {candidate}: {e}")
             continue
-    # If all failed, turn off persistence
     print("[memory] all sqlite locations failed; falling back to in-memory only")
     PERSIST_ENABLED = False
 
@@ -160,9 +145,6 @@ def _get_sticky(session_id: str) -> Dict[str, str]:
             print(f"[memory] get_sticky error: {e}")
     return _sticky[session_id]
 
-# -----------------------------
-# Sticky parser & header
-# -----------------------------
 sticky_pattern = re.compile(r"\[\[(remember|state)\s*:\s*([a-zA-Z0-9_]+)\s*=\s*(.+?)\]\]")
 
 def parse_and_update_sticky(text: str, session_id: str) -> str:
@@ -181,9 +163,6 @@ def sticky_header(session_id: str) -> str:
     pairs = "; ".join(f"{k}={v}" for k, v in s.items())
     return "STATE: " + pairs
 
-# -----------------------------
-# Profiles & system text
-# -----------------------------
 def _pick_profile_text() -> str:
     try:
         profiles = json.loads(PROFILES_JSON) if PROFILES_JSON else {}
@@ -191,13 +170,9 @@ def _pick_profile_text() -> str:
         profiles = {}
     if isinstance(profiles, dict):
         prof = profiles.get(DEFAULT_PROFILE, {})
-        system_text = prof.get("system") or ""
-        return system_text
+        return prof.get("system", "")
     return ""
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _full_mars_url() -> str:
     if MARS_CHAT_PATH and MARS_CHAT_PATH.startswith("/"):
         return MARS_API_URL.rstrip("/") + MARS_CHAT_PATH
@@ -232,7 +207,11 @@ def _build_messages(system_text: str, session_id: str, user_text: str) -> List[D
 
 def _mars_call(messages: List[Dict[str, str]], conversation_id: str) -> str:
     url = _full_mars_url()
-    headers = {"Authorization": f"Bearer {MARS_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {MARS_API_KEY}",
+        "X-API-Key": MARS_API_KEY,
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": MARS_MODEL,
         "conversation_id": conversation_id,
@@ -252,8 +231,9 @@ def _mars_call(messages: List[Dict[str, str]], conversation_id: str) -> str:
         except Exception:
             pass
 
-    r = requests.post(url, json=payload, headers=headers, timeout=int(os.getenv("MARS_TIMEOUT", "25")))
-    r.raise_for_status()
+    r = requests.post(url, json=payload, headers=headers, timeout=int(os.getenv("MARS_TIMEOUT","25")))
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code} {r.text}")
     data = r.json()
     try:
         reply = data["choices"][0]["message"]["content"]
@@ -261,16 +241,19 @@ def _mars_call(messages: List[Dict[str, str]], conversation_id: str) -> str:
         reply = json.dumps(data)
     return reply
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.route("/healthz")
 def healthz():
     return jsonify({
         "ok": True,
         "persist_enabled": PERSIST_ENABLED,
-        "db_path": MEMORY_DB_PATH if PERSIST_ENABLED else None
+        "db_path": MEMORY_DB_PATH if PERSIST_ENABLED else None,
+        "mars_url": _full_mars_url(),
+        "model": MARS_MODEL
     })
+
+@app.route("/health")
+def health_alias():
+    return healthz()
 
 @app.route("/admin/toggle", methods=["POST"])
 def admin_toggle():
