@@ -346,7 +346,13 @@ def chat():
         return jsonify({"error": "unauthorized", "ok": False}), 401
 
     # Quem é o "session_id" (usado para memória + allowlist)
-    session_id = str(payload.get("session_id") or request.remote_addr or "default").strip()
+    session_id = str(
+    (payload.get("session_id") if isinstance(payload, dict) else None)
+    or request.headers.get("x-session-id")
+    or request.remote_addr
+    or "default"
+).strip()
+
     if not _allowed(session_id):
         return jsonify({"error": "forbidden", "reason": "session not allowlisted"}), 403
 
