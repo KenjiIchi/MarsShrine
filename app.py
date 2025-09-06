@@ -10,6 +10,12 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================
+# App & JSON (não escapar Unicode)
+# =========================
+app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False  # evita \uXXXX no JSON
+
+# =========================
 # Config (ENV)
 # =========================
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "kenji-2025-bridge")
@@ -46,14 +52,25 @@ MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", DEFAULT_DB)
 MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "8"))
 MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "3500"))
 
-# App
-app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False   # <-- não escapar Unicode (\uXXXX)
-ENABLED = True  # kill-switch
+# Kill-switch
+ENABLED = True
 
 # In-memory fallback
 _history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MEMORY_TURNS * 2))
 _sticky: Dict[str, Dict[str, str]] = defaultdict(dict)
+
+# =========================
+# Helpers: Unicode uXXXX → char
+# =========================
+_u_plain = re.compile(r'(?<![A-Za-z0-9_])u([0-9a-fA-F]{4})')  # u2661
+_u_esc   = re.compile(r'\\u([0-9a-fA-F]{4})')                 # \u2661
+
+def _decode_u_sequences(s: str) -> str:
+    if not s:
+        return s
+    s = _u_esc.sub(lambda m: chr(int(m.group(1), 16)), s)
+    s = _u_plain.sub(lambda m: chr(int(m.group(1), 16)), s)
+    return s
 
 # =========================
 # DB helpers
@@ -69,16 +86,15 @@ def _db_conn(path: str):
     return conn
 
 def _init_db():
-    """Tenta inicializar persistência em sequência: env -> /var/data -> /tmp"""
+    """Tenta inicializar persistência em sequência: env -> /var/data -> /tmp -> %TEMP% (Windows)"""
     global MEMORY_DB_PATH, PERSIST_ENABLED
     if not PERSIST_ENABLED:
         print("[memory] persistence disabled")
         return
     candidates = [MEMORY_DB_PATH, DEFAULT_DB, "/tmp/memory.sqlite"]
     try:
-        # Windows TEMP (se existir) por último
         win_tmp = os.path.join(os.getenv("TEMP", ""), "memory.sqlite")
-        if win_tmp not in candidates:
+        if win_tmp not in candidates and win_tmp:
             candidates.append(win_tmp)
     except Exception:
         pass
@@ -175,8 +191,7 @@ def _get_sticky(session_id: str) -> Dict[str, str]:
     return _sticky[session_id]
 
 # =========================
-# Sticky/state helpers
-# [[remember:key=value]] ou [[state:key=value]]
+# Sticky/state helpers  [[remember:key=value]] / [[state:key=value]]
 # =========================
 sticky_pattern = re.compile(r"\[\[(remember|state)\s*:\s*([a-zA-Z0-9_]+)\s*=\s*(.+?)\]\]")
 
@@ -236,8 +251,7 @@ def _build_messages(system_text: str, session_id: str, user_text: str) -> List[D
     # janela deslizante por caracteres
     def total_chars(mm): return sum(len(m["content"]) for m in mm)
     while total_chars(msgs) > max(MEMORY_MAX_CHARS, 2000) and len(msgs) > 3:
-        # remove a segunda mensagem de usuário mais antiga (pula system/state)
-        del msgs[2]
+        del msgs[2]  # remove a segunda msg (a mais antiga do histórico), preservando system/state
     return msgs
 
 # =========================
@@ -346,13 +360,13 @@ def chat():
     if not _auth_ok(token):
         return jsonify({"error": "unauthorized", "ok": False}), 401
 
-    # Quem é o "session_id" (usado para memória + allowlist)
+    # session_id: aceita body, header x-session-id, ou remote_addr
     session_id = str(
-    (payload.get("session_id") if isinstance(payload, dict) else None)
-    or request.headers.get("x-session-id")
-    or request.remote_addr
-    or "default"
-).strip()
+        (payload.get("session_id") if isinstance(payload, dict) else None)
+        or request.headers.get("x-session-id")
+        or request.remote_addr
+        or "default"
+    ).strip()
 
     if not _allowed(session_id):
         return jsonify({"error": "forbidden", "reason": "session not allowlisted"}), 403
@@ -369,6 +383,7 @@ def chat():
 
     try:
         reply = _mars_call(messages, session_id)
+        reply = _decode_u_sequences(reply)  # <-- converte uXXXX/\uXXXX
     except Exception as e:
         return jsonify({"error": "upstream_failed", "detail": str(e)}), 502
 
