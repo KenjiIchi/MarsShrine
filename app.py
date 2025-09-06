@@ -60,16 +60,20 @@ _history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MEMORY_TURNS * 2))
 _sticky: Dict[str, Dict[str, str]] = defaultdict(dict)
 
 # =========================
-# Helpers: Unicode uXXXX → char
+# Helpers: Unicode uXXXX / \uXXXX → char (loop)
 # =========================
-_u_plain = re.compile(r'(?<![A-Za-z0-9_])u([0-9a-fA-F]{4})')  # u2661
-_u_esc   = re.compile(r'\\u([0-9a-fA-F]{4})')                 # \u2661
+_u_hex_plain = re.compile(r'u([0-9a-fA-F]{4})')   # u2661, uff40, u03b5...
+_u_hex_esc   = re.compile(r'\\u([0-9a-fA-F]{4})') # \u2661
 
 def _decode_u_sequences(s: str) -> str:
+    """Converte sequências uXXXX e \\uXXXX para os caracteres reais (aplica em loop)."""
     if not s:
         return s
-    s = _u_esc.sub(lambda m: chr(int(m.group(1), 16)), s)
-    s = _u_plain.sub(lambda m: chr(int(m.group(1), 16)), s)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _u_hex_esc.sub(lambda m: chr(int(m.group(1), 16)), s)
+        s = _u_hex_plain.sub(lambda m: chr(int(m.group(1), 16)), s)
     return s
 
 # =========================
@@ -86,7 +90,7 @@ def _db_conn(path: str):
     return conn
 
 def _init_db():
-    """Tenta inicializar persistência em sequência: env -> /var/data -> /tmp -> %TEMP% (Windows)"""
+    """Tenta inicializar persistência em sequência: env -> /var/data -> /tmp -> %TEMP% (Windows)."""
     global MEMORY_DB_PATH, PERSIST_ENABLED
     if not PERSIST_ENABLED:
         print("[memory] persistence disabled")
@@ -94,7 +98,7 @@ def _init_db():
     candidates = [MEMORY_DB_PATH, DEFAULT_DB, "/tmp/memory.sqlite"]
     try:
         win_tmp = os.path.join(os.getenv("TEMP", ""), "memory.sqlite")
-        if win_tmp not in candidates and win_tmp:
+        if win_tmp and win_tmp not in candidates:
             candidates.append(win_tmp)
     except Exception:
         pass
@@ -251,7 +255,7 @@ def _build_messages(system_text: str, session_id: str, user_text: str) -> List[D
     # janela deslizante por caracteres
     def total_chars(mm): return sum(len(m["content"]) for m in mm)
     while total_chars(msgs) > max(MEMORY_MAX_CHARS, 2000) and len(msgs) > 3:
-        del msgs[2]  # remove a segunda msg (a mais antiga do histórico), preservando system/state
+        del msgs[2]  # remove a mais antiga pós-state
     return msgs
 
 # =========================
