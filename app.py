@@ -48,6 +48,7 @@ MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "3500"))
 
 # App
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False   # <-- não escapar Unicode (\uXXXX)
 ENABLED = True  # kill-switch
 
 # In-memory fallback
