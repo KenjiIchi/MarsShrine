@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import unicodedata   # <-- adiciona isso
 import sqlite3
 from collections import defaultdict, deque
 from typing import List, Dict
