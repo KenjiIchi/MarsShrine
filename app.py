@@ -388,6 +388,7 @@ def chat():
     try:
         reply = _mars_call(messages, session_id)
         reply = _decode_u_sequences(reply)  # <-- converte uXXXX/\uXXXX
+        reply = unicodedata.normalize("NFC", reply)
     except Exception as e:
         return jsonify({"error": "upstream_failed", "detail": str(e)}), 502
 
