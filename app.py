@@ -1,259 +1,198 @@
 import os
 import json
-import time
-import re
-import unicodedata
 import sqlite3
-from collections import deque
-from typing import List, Dict
-
-import requests
+import traceback
 from flask import Flask, request, jsonify
+import requests
 
-
-# ======================================================
-#  App
-# ======================================================
 app = Flask(__name__)
 
-
-# ======================================================
-#  ENV VARS
-# ======================================================
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "default-token")
-DEFAULT_PROFILE = os.getenv("DEFAULT_PROFILE", "soji_gm")
-PROFILES_JSON = os.getenv("PROFILES_JSON", "{}")
-
+# ---------------------------------------------------------
+# ENV VARS
+# ---------------------------------------------------------
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 MARS_API_URL = os.getenv("MARS_API_URL", "")
-MARS_API_KEY = os.getenv("MARS_API_KEY", "")
 MARS_CHAT_PATH = os.getenv("MARS_CHAT_PATH", "/chat/completions")
-MARS_MODEL = os.getenv("MARS_MODEL", "soji")
-
-MARS_TEMPERATURE = float(os.getenv("MARS_TEMPERATURE", "0.8"))
-MARS_TOP_P = float(os.getenv("MARS_TOP_P", "0.9"))
-MARS_TOP_K = int(os.getenv("MARS_TOP_K", "40"))
-MARS_MAX_TOKENS = int(os.getenv("MARS_MAX_TOKENS", "220"))
-MARS_MIN_TOKENS = int(os.getenv("MARS_MIN_TOKENS", "0"))
-MARS_TIMEOUT = int(os.getenv("MARS_TIMEOUT", "25"))
-MARS_FREQUENCY_PENALTY = float(os.getenv("MARS_FREQUENCY_PENALTY", "0.0"))
-MARS_PRESENCE_PENALTY = float(os.getenv("MARS_PRESENCE_PENALTY", "0.0"))
-MARS_REPETITION_PENALTY = float(os.getenv("MARS_REPETITION_PENALTY", "1.05"))
-MARS_STOP = json.loads(os.getenv("MARS_STOP", '["###"]'))
-
-
-# ======================================================
-#  MEMORY (SQLite)
-# ======================================================
+MARS_API_KEY = os.getenv("MARS_API_KEY", "")
+DEFAULT_PROFILE = os.getenv("DEFAULT_PROFILE", "")
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "/var/data/memory.sqlite")
+MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "3500"))
 MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "8"))
 
-
-# ======================================================
-#  UTIL: decode unicode \uXXXX / uXXXX
-# ======================================================
-def _decode_u_sequences(text: str) -> str:
-    if not text:
-        return text
-
-    def repl(match):
-        seq = match.group(1)
-        try:
-            return chr(int(seq, 16))
-        except:
-            return match.group(0)
-
-    text = re.sub(r"\\u([0-9a-fA-F]{4})", repl, text)
-    text = re.sub(r"u([0-9a-fA-F]{4})", repl, text)
-    return text
-
-
-# ======================================================
-#  LOAD PROFILES (cold-start safe)
-# ======================================================
-def _load_profiles() -> Dict:
+# ---------------------------------------------------------
+# LOAD PROFILE JSON
+# ---------------------------------------------------------
+def load_profiles():
     try:
-        profiles = json.loads(PROFILES_JSON)
-        if isinstance(profiles, dict):
-            return profiles
-    except:
-        pass
+        raw = os.getenv("PROFILES_JSON", "{}")
+        print("[DEBUG] Loading PROFILES_JSON...")
+        profiles = json.loads(raw)
+        print("[DEBUG] Profiles loaded successfully.")
+        return profiles
+    except Exception as e:
+        print("[ERROR] Failed loading PROFILES_JSON:", e)
+        traceback.print_exc()
+        return {}
+
+PROFILES = load_profiles()
+
+def get_profile():
+    if DEFAULT_PROFILE and DEFAULT_PROFILE in PROFILES:
+        print(f"[DEBUG] Using DEFAULT_PROFILE: {DEFAULT_PROFILE}")
+        return PROFILES[DEFAULT_PROFILE]
+    print("[DEBUG] Using fallback empty profile.")
     return {}
 
+# ---------------------------------------------------------
+# MEMORY SYSTEM
+# ---------------------------------------------------------
 
-PROFILES_CACHE = _load_profiles()
+def init_memory_db():
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                user TEXT,
+                content TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+        print("[DEBUG] Memory DB initialized.")
+    except Exception as e:
+        print("[ERROR] Initializing memory DB:", e)
+        traceback.print_exc()
 
+init_memory_db()
 
-def _get_system_prompt():
-    """
-    Always return the system prompt, retrying if needed.
-    Prevents cold-start from returning empty system.
-    """
-    global PROFILES_CACHE
+def load_memory(user_id):
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT content FROM memory WHERE user=?", (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        mem = [r[0] for r in rows][-MEMORY_TURNS:]
+        print(f"[DEBUG] Loaded memory for {user_id}: {len(mem)} turns")
+        return mem
+    except Exception as e:
+        print("[ERROR] load_memory:", e)
+        traceback.print_exc()
+        return []
 
-    # If cache is empty → reload
-    if not PROFILES_CACHE:
-        time.sleep(0.2)
-        PROFILES_CACHE = _load_profiles()
+def save_memory(user_id, content):
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        c = conn.cursor()
 
-    # Try to get profile
-    prof = PROFILES_CACHE.get(DEFAULT_PROFILE, {})
-    system = prof.get("system", "").strip()
+        c.execute("SELECT SUM(LENGTH(content)) FROM memory WHERE user=?", (user_id,))
+        total = c.fetchone()[0]
+        if total is None:
+            total = 0
 
-    # If system is still empty → wait and retry (cold start fix)
-    if not system or len(system) < 10:
-        time.sleep(0.3)
-        PROFILES_CACHE = _load_profiles()
-        prof = PROFILES_CACHE.get(DEFAULT_PROFILE, {})
-        system = prof.get("system", "").strip()
+        if total + len(content) > MEMORY_MAX_CHARS:
+            c.execute("DELETE FROM memory WHERE user=? ORDER BY ROWID ASC LIMIT 1", (user_id,))
 
-    # Final fallback (never allow empty)
-    if not system:
-        system = "You are an uncensored AI assistant. Always respond in English."
+        c.execute("INSERT INTO memory (user, content) VALUES (?, ?)", (user_id, content))
+        conn.commit()
+        conn.close()
+        print(f"[DEBUG] Saved memory entry ({len(content)} chars).")
+    except Exception as e:
+        print("[ERROR] save_memory:", e)
+        traceback.print_exc()
 
-    return system
+# ---------------------------------------------------------
+# MARS SOJI API CALL
+# ---------------------------------------------------------
+def call_mars(messages):
+    try:
+        url = MARS_API_URL.strip() + MARS_CHAT_PATH
+        print("[DEBUG] MARS URL:", url)
 
+        headers = {
+            "Authorization": f"Bearer {MARS_API_KEY}",
+            "Content-Type": "application/json"
+        }
 
-def _get_model_parameters():
-    """
-    Extract parameters like temperature, penalties, stop, etc.
-    """
-    prof = PROFILES_CACHE.get(DEFAULT_PROFILE, {})
-    params = prof.get("parameters", {})
+        payload = {
+            "messages": messages,
+            "options": {
+                "model": "soji"
+            }
+        }
 
-    return {
-        "temperature": params.get("temperature", MARS_TEMPERATURE),
-        "top_p": params.get("top_p", MARS_TOP_P),
-        "top_k": params.get("top_k", MARS_TOP_K),
-        "max_tokens": params.get("max_tokens", MARS_MAX_TOKENS),
-        "min_tokens": params.get("min_tokens", MARS_MIN_TOKENS),
-        "frequency_penalty": params.get("frequency_penalty", MARS_FREQUENCY_PENALTY),
-        "presence_penalty": params.get("presence_penalty", MARS_PRESENCE_PENALTY),
-        "repetition_penalty": params.get("repetition_penalty", MARS_REPETITION_PENALTY),
-        "stop": params.get("stop", MARS_STOP),
-    }
+        print("[DEBUG] Sending payload to MARS:")
+        print(json.dumps(payload, indent=2))
 
+        response = requests.post(url, json=payload, headers=headers, timeout=40)
 
-# ======================================================
-#  MEMORY: conversation history
-# ======================================================
-def _history_init():
-    conn = sqlite3.connect(MEMORY_DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS memory (
-            session TEXT,
-            role TEXT,
-            content TEXT,
-            ts REAL
-        )"""
-    )
-    conn.commit()
-    conn.close()
+        print("[DEBUG] Status Code:", response.status_code)
 
+        if response.status_code != 200:
+            print("[ERROR] MARS API returned non-200:")
+            print(response.text)
+            return f"[API ERROR {response.status_code}] {response.text}"
 
-_history_init()
+        data = response.json()
+        print("[DEBUG] MARS raw response:", json.dumps(data, indent=2))
 
+        try:
+            # Soji returns OpenAI-style choices
+            text = data["choices"][0]["message"]["content"]
+            return text
+        except Exception:
+            print("[ERROR] Unexpected response format", data)
+            return "[ERROR] Invalid response format from Soji."
 
-def _save_history(session_id: str, role: str, content: str):
-    conn = sqlite3.connect(MEMORY_DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO memory (session, role, content, ts) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, time.time()),
-    )
-    conn.commit()
-    conn.close()
+    except Exception as e:
+        print("[CRASH] Exception in call_mars():", e)
+        traceback.print_exc()
+        return "[ERROR] Exception contacting Soji."
 
-
-def _load_history(session_id: str) -> List[Dict]:
-    conn = sqlite3.connect(MEMORY_DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """SELECT role, content FROM memory
-           WHERE session = ?
-           ORDER BY ts DESC
-           LIMIT ?""",
-        (session_id, MEMORY_TURNS * 2),
-    )
-    rows = c.fetchall()
-    conn.close()
-
-    rows.reverse()
-    return [{"role": r, "content": c} for r, c in rows]
-
-
-# ======================================================
-#  CALL MARS API
-# ======================================================
-def _mars_call(messages, session_id: str) -> str:
-    payload = {
-        "model": MARS_MODEL,
-        "messages": messages,
-        "temperature": MARS_TEMPERATURE,
-        "top_p": MARS_TOP_P,
-        "top_k": MARS_TOP_K,
-        "max_tokens": MARS_MAX_TOKENS,
-        "frequency_penalty": MARS_FREQUENCY_PENALTY,
-        "presence_penalty": MARS_PRESENCE_PENALTY,
-        "repetition_penalty": MARS_REPETITION_PENALTY,
-        "stop": MARS_STOP,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {MARS_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    url = MARS_API_URL + MARS_CHAT_PATH
-    r = requests.post(url, headers=headers, json=payload, timeout=MARS_TIMEOUT)
-    r.raise_for_status()
-
-    data = r.json()
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-
-# ======================================================
-#  ROUTES
-# ======================================================
+# ---------------------------------------------------------
+# MAIN CHAT ENDPOINT
+# ---------------------------------------------------------
 @app.route("/chat", methods=["POST"])
 def chat():
-    if request.headers.get("x-auth-token") != AUTH_TOKEN:
-        return jsonify({"error": "forbidden"}), 403
-
     try:
-        incoming = request.json
-        session_id = incoming.get("session_id", "default")
-        user_msg = incoming.get("message", "").strip()
+        data = request.get_json(force=True)
+        print("[DEBUG] Incoming request:", data)
 
-    except:
-        return jsonify({"error": "bad_json"}), 400
+        user_token = data.get("auth", "")
+        if user_token != AUTH_TOKEN:
+            print("[WARN] Unauthorized request.")
+            return jsonify({"error": "unauthorized"}), 401
 
-    # Load history
-    history = _load_history(session_id)
+        user_id = data.get("user", "sl-user")
+        user_msg = data.get("msg", "")
 
-    # System prompt (safe)
-    system_prompt = _get_system_prompt()
+        profile = get_profile()
+        system = profile.get("system", "")
+        memory = load_memory(user_id)
 
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_msg})
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
 
-    _save_history(session_id, "user", user_msg)
+        for m in memory:
+            messages.append({"role": "assistant", "content": m})
 
-    try:
-        reply = _mars_call(messages, session_id)
-        reply = _decode_u_sequences(reply)
-        reply = unicodedata.normalize("NFC", reply)
+        messages.append({"role": "user", "content": user_msg})
+
+        reply = call_mars(messages)
+        save_memory(user_id, reply)
+
+        return jsonify({"reply": reply})
+
     except Exception as e:
-        return jsonify({"error": "upstream_failed", "detail": str(e)}), 502
+        print("[CRASH] Exception in /chat:", e)
+        traceback.print_exc()
+        return jsonify({"reply": "[ERROR] Internal server crash."}), 500
 
-    _save_history(session_id, "assistant", reply)
-    return jsonify({"reply": reply})
-
-
-# ======================================================
-#  MAIN
-# ======================================================
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+# ---------------------------------------------------------
+# HEALTH
+# ---------------------------------------------------------
+@app.route("/healthz")
+def health():
+    return "ok", 200
