@@ -13,7 +13,7 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 MARS_API_KEY = os.getenv("MARS_API_KEY", "")
 MARS_MODEL = os.getenv("MARS_MODEL", "mixtral-mars")  # modelo padrão
 DB_PATH = os.getenv("MEMORY_DB_PATH", "/var/data/memory.sqlite")
-PROFILE_JSON = os.getenv("PROFILE_JSON", "")
+PROFILES_JSON = os.getenv("PROFILES_JSON", "{}")
 
 def load_profile():
     try:
@@ -150,3 +150,4 @@ def chat():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
