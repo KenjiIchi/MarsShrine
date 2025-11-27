@@ -6,42 +6,35 @@ import requests
 
 app = Flask(__name__)
 
-# ==========================================================
+# ======================================
 # CONFIG
-# ==========================================================
-MARS_API = "https://api.chub.ai/api/v1/chat"   # Mixtral (Mars Default)
-PROFILE_JSON = os.getenv("PROFILE_JSON", "{}")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")  # x-auth-token for your SL bridge
+# ======================================
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+MARS_API_KEY = os.getenv("MARS_API_KEY", "")
+MARS_MODEL = os.getenv("MARS_MODEL", "mixtral-mars")  # modelo padrão
 DB_PATH = os.getenv("MEMORY_DB_PATH", "/var/data/memory.sqlite")
+PROFILE_JSON = os.getenv("PROFILE_JSON", "")
 
-# ==========================================================
-# ACCESS CONTROL (MASTER + SUB + EXTRA UUID LIST)
-# ==========================================================
-MASTER_UUID = os.getenv("MASTER_UUID", "").strip()
-SUB_UUID = os.getenv("SUB_UUID", "").strip()
-raw_env_allow = os.getenv("ALLOWLIST", "")
+def load_profile():
+    try:
+        return json.loads(PROFILE_JSON)
+    except:
+        print("[ERROR] Could not load PROFILE_JSON")
+        return {}
 
-parsed_allowlist = [
-    x.strip()
-    for x in raw_env_allow.split(",")
-    if x.strip()
-]
+PROFILE = load_profile()
+DEFAULT_PROFILE = PROFILE.get("soji_gm", {})
 
-ALLOWLIST = set(
-    [uuid for uuid in [MASTER_UUID, SUB_UUID] if uuid] +
-    parsed_allowlist
-)
-
-# ==========================================================
+# ======================================
 # MEMORY SYSTEM
-# ==========================================================
+# ======================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS memory (
-            user TEXT NOT NULL,
-            content TEXT NOT NULL
+            user TEXT,
+            content TEXT
         )
     """)
     conn.commit()
@@ -49,125 +42,111 @@ def init_db():
 
 init_db()
 
-def load_memory(user_id):
+def load_memory(user):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT content FROM memory WHERE user=?", (user_id,))
+        c.execute("SELECT content FROM memory WHERE user=?", (user,))
         rows = c.fetchall()
         conn.close()
 
-        if not rows:
-            return []
-
-        return [json.loads(r[0]) for r in rows]
+        return [r[0] for r in rows]
     except Exception as e:
         print("[ERROR] load_memory:", e)
         return []
 
-def save_memory(user_id, role, msg):
+def save_memory(user, msg):
     try:
-        item = json.dumps({"role": role, "content": msg})
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT INTO memory(user, content) VALUES (?, ?)", (user_id, item))
+        c.execute("INSERT INTO memory (user, content) VALUES (?,?)", (user, msg))
         conn.commit()
         conn.close()
     except Exception as e:
         print("[ERROR] save_memory:", e)
 
-# ==========================================================
-# LOAD JSON PROFILE
-# ==========================================================
-try:
-    PROFILE_DATA = json.loads(PROFILE_JSON)
-    print("[PROFILE] Loaded successfully.")
-except Exception as e:
-    PROFILE_DATA = {}
-    print("[ERROR] Could not load PROFILE_JSON:", e)
-
-DEFAULT_PROFILE = "soji_gm"
-
-def build_messages(user_id, user_msg):
-    profile = PROFILE_DATA.get(DEFAULT_PROFILE, {})
-    memory = load_memory(user_id)
-
-    messages = []
-
-    if "system" in profile:
-        messages.append({"role": "system", "content": profile["system"]})
-
-    messages.extend(memory)
-    messages.append({"role": "user", "content": user_msg})
-
-    return messages
-
-# ==========================================================
-# CALL MARS MODEL
-# ==========================================================
-def call_mars(messages):
-    try:
-        payload = {
-            "messages": messages,
-            "model": "mixtral-mars-default",   # Model name for Chub.ai Mixtral
-            "temperature": 0.9,
-        }
-
-        headers = {"Content-Type": "application/json"}
-
-        r = requests.post(MARS_API, headers=headers, json=payload)
-
-        if r.status_code != 200:
-            print("[ERROR] MARS returned:", r.status_code, r.text)
-            return "[API ERROR {}] {}".format(r.status_code, r.text)
-
-        data = r.json()
-        reply = data["choices"][0]["message"]["content"]
-        return reply
-
-    except Exception as e:
-        print("[ERROR] call_mars:", e)
-        return "[ERROR] Could not reach MARS API"
-
-# ==========================================================
-# ROUTES
-# ==========================================================
-@app.route("/healthz")
-def health():
+# ======================================
+# HEALTH CHECK
+# ======================================
+@app.get("/healthz")
+def healthz():
     return "OK", 200
 
-@app.route("/chat", methods=["POST"])
+# ======================================
+# MAIN CHAT ENDPOINT
+# ======================================
+@app.post("/chat")
 def chat():
+    # tenta ler JSON
+    data = {}
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
     except:
-        return jsonify({"error": "Invalid JSON"}), 400
+        data = {}
 
-    auth = data.get("auth", "")
-    user = data.get("user", "").strip()
-    msg = data.get("msg", "").strip()
+    # ❤️ VOLTAMOS AO ANTIGO COMPORTAMENTO (JSON OU HEADER)
+    auth = data.get("auth") or request.headers.get("x-auth-token")
 
-    # AUTH FOR LSL
     if auth != AUTH_TOKEN:
-        return jsonify({"reply": "[403] Invalid auth token"}), 200
+        return jsonify({"error": "Invalid auth token"}), 403
 
-    # UUID ALLOWLIST
-    if user not in ALLOWLIST:
-        print("[DENY] User not in allowlist:", user)
-        return jsonify({"reply": "[403] Access denied"}), 200
+    user = (
+        data.get("user")
+        or data.get("session_id")
+        or request.remote_addr
+        or "unknown"
+    )
 
-    print(f"[REQUEST] From {user}: {msg}")
+    msg = data.get("msg") or data.get("message") or ""
+    if not msg:
+        return jsonify({"error": "No message"}), 400
 
-    messages = build_messages(user, msg)
-    reply = call_mars(messages)
+    # memory
+    history = load_memory(user)
+    save_memory(user, msg)
 
-    save_memory(user, "user", msg)
-    save_memory(user, "assistant", reply)
+    # monta payload para Mars
+    sys_prompt = DEFAULT_PROFILE.get("system", "")
+    messages = [{"role": "system", "content": sys_prompt}]
+
+    for h in history[-8:]:
+        messages.append({"role": "user", "content": h})
+
+    messages.append({"role": "user", "content": msg})
+
+    payload = {
+        "messages": messages,
+        "options": {"model": MARS_MODEL}
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": MARS_API_KEY
+    }
+
+    # envia para Mars API
+    r = requests.post(
+        "https://api.mars.guru/v1/chat/completions",
+        headers=headers,
+        json=payload
+    )
+
+    if r.status_code != 200:
+        return jsonify({
+            "error": "MARS API error",
+            "status": r.status_code,
+            "body": r.text
+        }), 200
+
+    try:
+        reply = r.json()["choices"][0]["message"]["content"]
+    except:
+        reply = "Malformed reply"
+
+    save_memory(user, reply)
 
     return jsonify({"reply": reply}), 200
 
-# ==========================================================
-# MAIN
-# ==========================================================
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
