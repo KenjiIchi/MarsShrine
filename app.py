@@ -238,7 +238,7 @@ def _auth_ok(token: str) -> bool:
     return (token or "") == AUTH_TOKEN
 
 def _allowed(session_id: str) -> bool:
-    return (session_id in ALLOWLIST)
+    return True
 
 def _build_messages(system_text: str, session_id: str, user_text: str) -> List[Dict[str, str]]:
     _load_history(session_id)
@@ -400,3 +400,4 @@ def chat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
