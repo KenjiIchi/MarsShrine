@@ -203,38 +203,11 @@ sticky_pattern = re.compile(r"\[\[(remember|state)\s*:\s*([a-zA-Z0-9_]+)\s*=\s*(
 def parse_and_update_sticky(text: str, session_id: str) -> str:
     if not text:
         return text
-
-    reset = False
-
     for m in sticky_pattern.finditer(text):
         key, val = m.group(2), m.group(3).strip()
-
-        # 🔴 comando especial: [[state:reset_session=...]]
-        if key == "reset_session":
-            reset = True
-        else:
-            _set_sticky(session_id, key, val)
-
-    # se veio reset_session → limpa memória
-    if reset:
-        # limpa memória em RAM
-        _history[session_id].clear()
-        # limpa do banco, se estiver usando PERSIST_ENABLED=true
-        if PERSIST_ENABLED:
-            try:
-                conn = _db_conn(MEMORY_DB_PATH)
-                cur = conn.cursor()
-                cur.execute("DELETE FROM history WHERE session_id=?", (session_id,))
-                cur.execute("DELETE FROM sticky  WHERE session_id=?", (session_id,))
-                conn.commit()
-                conn.close()
-                print(f"[memory] reset session {session_id}")
-            except Exception as e:
-                print(f"[memory] reset_session error: {e}")
-
+        _set_sticky(session_id, key, val)
     clean = sticky_pattern.sub("", text).strip()
     return clean
-
 
 def sticky_header(session_id: str) -> str:
     s = _get_sticky(session_id)
@@ -265,7 +238,7 @@ def _auth_ok(token: str) -> bool:
     return (token or "") == AUTH_TOKEN
 
 def _allowed(session_id: str) -> bool:
-    return True
+    return (session_id in ALLOWLIST)
 
 def _build_messages(system_text: str, session_id: str, user_text: str) -> List[Dict[str, str]]:
     _load_history(session_id)
@@ -427,5 +400,3 @@ def chat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
